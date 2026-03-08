@@ -7,12 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"regexp"
+	"path"
 	"strings"
 )
 
-// bearerRegex extracts the token from "Authorization: Bearer <token>". Compiled once to avoid per-request allocation.
-var bearerRegex = regexp.MustCompile(`Bearer\s+(?P<key>\S+)`)
+const maxCredentialLength = 4096
 
 type Config struct {
 	AuthenticationHeader      bool     `json:"authenticationHeader,omitempty"`
@@ -35,15 +34,20 @@ type Response struct {
 	StatusCode int    `json:"status_code"`
 }
 
+type keyMaterial struct {
+	raw   string
+	bytes []byte
+}
+
 func CreateConfig() *Config {
 	return &Config{
 		AuthenticationHeader:      true,
 		AuthenticationHeaderName:  "X-API-KEY",
 		BearerHeader:              true,
 		BearerHeaderName:          "Authorization",
-		QueryParam:                true,
+		QueryParam:                false,
 		QueryParamName:            "token",
-		PathSegment:               true,
+		PathSegment:               false,
 		PermissiveMode:            false,
 		Keys:                      make([]string, 0),
 		RemoveHeadersOnSuccess:    true,
@@ -63,7 +67,7 @@ type KeyAuth struct {
 	queryParamName            string
 	pathSegment               bool
 	permissiveMode            bool
-	keys                      []string
+	keysByLength              map[int][]keyMaterial
 	removeHeadersOnSuccess    bool
 	internalForwardHeaderName string
 	internalErrorRoute        string
@@ -71,32 +75,101 @@ type KeyAuth struct {
 }
 
 // resolveKeys expands config keys: entries "env:VAR_NAME" are replaced by the value of the environment variable.
-// Returns the final list of keys and an error if no keys remain.
+// Returns the final list of keys and an error if no keys remain or when an env key is missing.
 func resolveKeys(rawKeys []string) ([]string, error) {
-	var keys []string
+	seen := make(map[string]struct{}, len(rawKeys))
+	keys := make([]string, 0, len(rawKeys))
+
 	for _, k := range rawKeys {
 		k = strings.TrimSpace(k)
 		if k == "" {
 			continue
 		}
+
 		if strings.HasPrefix(k, "env:") {
 			envVar := strings.TrimSpace(strings.TrimPrefix(k, "env:"))
-			if envVar != "" {
-				if v := os.Getenv(envVar); v != "" {
-					keys = append(keys, v)
-				}
+			if envVar == "" {
+				return nil, fmt.Errorf("invalid env key reference: %q", k)
 			}
+
+			v := strings.TrimSpace(os.Getenv(envVar))
+			if v == "" {
+				return nil, fmt.Errorf("environment variable %q is empty or missing", envVar)
+			}
+			k = v
+		}
+
+		if len(k) > maxCredentialLength {
+			return nil, fmt.Errorf("configured key exceeds maximum length (%d)", maxCredentialLength)
+		}
+
+		if _, exists := seen[k]; exists {
 			continue
 		}
+		seen[k] = struct{}{}
 		keys = append(keys, k)
 	}
+
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("must specify at least one valid key (or use env:VAR_NAME)")
 	}
 	return keys, nil
 }
 
+func buildKeyIndex(keys []string) map[int][]keyMaterial {
+	index := make(map[int][]keyMaterial, len(keys))
+	for _, k := range keys {
+		m := keyMaterial{raw: k, bytes: []byte(k)}
+		index[len(k)] = append(index[len(k)], m)
+	}
+	return index
+}
+
+func normalizeRoutePrefix(value string) string {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return ""
+	}
+	if !strings.HasPrefix(v, "/") {
+		v = "/" + v
+	}
+	clean := path.Clean(v)
+	if clean == "." {
+		return "/"
+	}
+	return clean
+}
+
+func normalizeExemptPaths(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(raw))
+	normalized := make([]string, 0, len(raw))
+	for _, p := range raw {
+		n := normalizeRoutePrefix(p)
+		if n == "" {
+			continue
+		}
+		if n != "/" {
+			n = strings.TrimSuffix(n, "/")
+		}
+		if _, exists := seen[n]; exists {
+			continue
+		}
+		seen[n] = struct{}{}
+		normalized = append(normalized, n)
+	}
+	return normalized
+}
+
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+	_ = ctx
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+
 	// Do not log config to avoid leaking keys
 	_, _ = os.Stdout.WriteString("traefik_api_key_auth: creating plugin " + name + "\n")
 
@@ -109,37 +182,58 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		return nil, fmt.Errorf("at least one method must be true")
 	}
 
+	authHeaderName := strings.TrimSpace(config.AuthenticationHeaderName)
+	if config.AuthenticationHeader && authHeaderName == "" {
+		return nil, fmt.Errorf("authenticationHeaderName cannot be empty when authenticationHeader is enabled")
+	}
+
+	bearerHeaderName := strings.TrimSpace(config.BearerHeaderName)
+	if config.BearerHeader && bearerHeaderName == "" {
+		return nil, fmt.Errorf("bearerHeaderName cannot be empty when bearerHeader is enabled")
+	}
+
+	queryParamName := strings.TrimSpace(config.QueryParamName)
+	if config.QueryParam && queryParamName == "" {
+		return nil, fmt.Errorf("queryParamName cannot be empty when queryParam is enabled")
+	}
+
+	internalErrorRoute := normalizeRoutePrefix(config.InternalErrorRoute)
+
 	return &KeyAuth{
 		next:                      next,
 		authenticationHeader:      config.AuthenticationHeader,
-		authenticationHeaderName:  config.AuthenticationHeaderName,
+		authenticationHeaderName:  authHeaderName,
 		bearerHeader:              config.BearerHeader,
-		bearerHeaderName:          config.BearerHeaderName,
+		bearerHeaderName:          bearerHeaderName,
 		queryParam:                config.QueryParam,
-		queryParamName:            config.QueryParamName,
+		queryParamName:            queryParamName,
 		pathSegment:               config.PathSegment,
 		permissiveMode:            config.PermissiveMode,
-		keys:                      resolvedKeys,
+		keysByLength:              buildKeyIndex(resolvedKeys),
 		removeHeadersOnSuccess:    config.RemoveHeadersOnSuccess,
-		internalForwardHeaderName: config.InternalForwardHeaderName,
-		internalErrorRoute:        config.InternalErrorRoute,
-		exemptPaths:               config.ExemptPaths,
+		internalForwardHeaderName: strings.TrimSpace(config.InternalForwardHeaderName),
+		internalErrorRoute:        internalErrorRoute,
+		exemptPaths:               normalizeExemptPaths(config.ExemptPaths),
 	}, nil
 }
 
-// constantTimeContains returns the matching valid key if the provided key matches any of them using constant-time comparison.
-// Empty provided key never matches. Used to prevent timing attacks.
-func constantTimeContains(provided string, validKeys []string) string {
-	if provided == "" {
+// findMatchingKey returns the matching valid key if the provided key matches any of them using constant-time comparison.
+// Empty provided key never matches. Used to reduce timing attacks.
+func findMatchingKey(provided string, keysByLength map[int][]keyMaterial) string {
+	provided = strings.TrimSpace(provided)
+	if provided == "" || len(provided) > maxCredentialLength {
 		return ""
 	}
+
+	candidates := keysByLength[len(provided)]
+	if len(candidates) == 0 {
+		return ""
+	}
+
 	providedB := []byte(provided)
-	for _, valid := range validKeys {
-		if len(providedB) != len(valid) {
-			continue
-		}
-		if subtle.ConstantTimeCompare(providedB, []byte(valid)) == 1 {
-			return valid
+	for _, valid := range candidates {
+		if subtle.ConstantTimeCompare(providedB, valid.bytes) == 1 {
+			return valid.raw
 		}
 	}
 	return ""
@@ -147,57 +241,80 @@ func constantTimeContains(provided string, validKeys []string) string {
 
 // extractBearerToken returns the token from "Authorization: Bearer <token>" or empty string if not in that form.
 func extractBearerToken(headerValue string) string {
-	matches := bearerRegex.FindStringSubmatch(strings.TrimSpace(headerValue))
-	if matches == nil {
+	headerValue = strings.TrimSpace(headerValue)
+	if headerValue == "" {
 		return ""
 	}
-	idx := bearerRegex.SubexpIndex("key")
-	if idx < 0 {
+
+	scheme, token, found := strings.Cut(headerValue, " ")
+	if !found || !strings.EqualFold(strings.TrimSpace(scheme), "Bearer") {
 		return ""
 	}
-	return strings.TrimSpace(matches[idx])
+
+	token = strings.TrimSpace(token)
+	if token == "" || strings.ContainsAny(token, " \t") {
+		return ""
+	}
+	if len(token) > maxCredentialLength {
+		return ""
+	}
+	return token
 }
 
 // pathSegmentMatchesKey returns the matching key if any path segment (between slashes) exactly matches a valid key.
 // Uses constant-time comparison; avoids substring matching for security.
-func pathSegmentMatchesKey(path string, validKeys []string) string {
-	segments := strings.Split(path, "/")
-	for _, seg := range segments {
-		if seg == "" {
+func pathSegmentMatchesKey(pathValue string, keysByLength map[int][]keyMaterial) string {
+	start := -1
+	for i := 0; i <= len(pathValue); i++ {
+		if i == len(pathValue) || pathValue[i] == '/' {
+			if start >= 0 && i > start {
+				if matched := findMatchingKey(pathValue[start:i], keysByLength); matched != "" {
+					return matched
+				}
+			}
+			start = -1
 			continue
 		}
-		if matched := constantTimeContains(seg, validKeys); matched != "" {
-			return matched
+		if start == -1 {
+			start = i
 		}
 	}
 	return ""
 }
 
+func requestPathForLog(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return "/"
+	}
+	p := req.URL.EscapedPath()
+	if p == "" {
+		return "/"
+	}
+	return p
+}
+
 func (ka *KeyAuth) ok(rw http.ResponseWriter, req *http.Request, matchedKey string) {
-	// Do not log the key to avoid leaking secrets
-	_, _ = os.Stdout.WriteString("traefik_api_key_auth: valid credentials for URL " + req.URL.String() + "\n")
+	_, _ = os.Stdout.WriteString("traefik_api_key_auth: valid credentials for path " + requestPathForLog(req) + "\n")
 	if ka.internalForwardHeaderName != "" {
-		req.Header.Add(ka.internalForwardHeaderName, matchedKey)
+		req.Header.Del(ka.internalForwardHeaderName)
+		req.Header.Set(ka.internalForwardHeaderName, matchedKey)
 	}
 	req.RequestURI = req.URL.RequestURI()
 	ka.next.ServeHTTP(rw, req)
 }
 
 func (ka *KeyAuth) permissiveOk(rw http.ResponseWriter, req *http.Request) {
-	_, _ = os.Stderr.WriteString("traefik_api_key_auth: no valid credentials for URL \"" + req.URL.String() + "\"; allowing in permissive mode\n")
+	_, _ = os.Stderr.WriteString("traefik_api_key_auth: no valid credentials for path \"" + requestPathForLog(req) + "\"; allowing in permissive mode\n")
 	req.RequestURI = req.URL.RequestURI()
 	ka.next.ServeHTTP(rw, req)
 }
 
-func (ka *KeyAuth) isExempt(path string) bool {
+func (ka *KeyAuth) isExempt(pathValue string) bool {
 	for _, prefix := range ka.exemptPaths {
-		if prefix == "" {
-			continue
-		}
-		if path == prefix || strings.HasPrefix(path, strings.TrimSuffix(prefix, "/")+"/") || strings.HasPrefix(path, prefix+"/") {
+		if prefix == "/" {
 			return true
 		}
-		if path == strings.TrimSuffix(prefix, "/") {
+		if pathValue == prefix || strings.HasPrefix(pathValue, prefix+"/") {
 			return true
 		}
 	}
@@ -205,8 +322,8 @@ func (ka *KeyAuth) isExempt(path string) bool {
 }
 
 func (ka *KeyAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	path := req.URL.Path
-	if ka.isExempt(path) {
+	pathValue := req.URL.Path
+	if ka.isExempt(pathValue) {
 		req.RequestURI = req.URL.RequestURI()
 		ka.next.ServeHTTP(rw, req)
 		return
@@ -214,7 +331,7 @@ func (ka *KeyAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	if ka.authenticationHeader {
 		provided := req.Header.Get(ka.authenticationHeaderName)
-		if matched := constantTimeContains(provided, ka.keys); matched != "" {
+		if matched := findMatchingKey(provided, ka.keysByLength); matched != "" {
 			if ka.removeHeadersOnSuccess {
 				req.Header.Del(ka.authenticationHeaderName)
 			}
@@ -225,7 +342,7 @@ func (ka *KeyAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	if ka.bearerHeader {
 		token := extractBearerToken(req.Header.Get(ka.bearerHeaderName))
-		if matched := constantTimeContains(token, ka.keys); matched != "" {
+		if matched := findMatchingKey(token, ka.keysByLength); matched != "" {
 			if ka.removeHeadersOnSuccess {
 				req.Header.Del(ka.bearerHeaderName)
 			}
@@ -237,7 +354,7 @@ func (ka *KeyAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if ka.queryParam {
 		qs := req.URL.Query()
 		provided := qs.Get(ka.queryParamName)
-		if matched := constantTimeContains(provided, ka.keys); matched != "" {
+		if matched := findMatchingKey(provided, ka.keysByLength); matched != "" {
 			qs.Del(ka.queryParamName)
 			req.URL.RawQuery = qs.Encode()
 			ka.ok(rw, req, matched)
@@ -246,7 +363,7 @@ func (ka *KeyAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if ka.pathSegment {
-		if matched := pathSegmentMatchesKey(path, ka.keys); matched != "" {
+		if matched := pathSegmentMatchesKey(pathValue, ka.keysByLength); matched != "" {
 			ka.ok(rw, req, matched)
 			return
 		}
