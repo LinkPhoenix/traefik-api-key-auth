@@ -1,0 +1,24 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create GitHub Release (latest)
+        uses: ncipollo/release-action@v1
+        with:
+          makeLatest: true
+          generateReleaseNotes: false
+          bodyFile: CHANGELOG.md
+          skipIfReleaseExists: true

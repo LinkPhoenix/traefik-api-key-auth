@@ -36,6 +36,14 @@ Ensure this repository always satisfies Traefik plugin catalog requirements befo
 - Must have at least one semantic version Git tag (example: `v0.1.0`).
 - Tag must be pushed to origin.
 - Catalog indexing depends on versioned sources available through Go module proxy.
+- Every new published version must increment the previous version using `vX.Y.Z`:
+  - `X`: major release (breaking changes or major milestone)
+  - `Y`: minor release (new backward-compatible features)
+  - `Z`: patch release (very small fixes/adjustments)
+- Never reuse or overwrite an existing version tag.
+- Every new tag must have a corresponding GitHub Release and must be marked as `latest`.
+- Release creation is automated by GitHub Actions on tag push (`vX.Y.Z`).
+- Do not manually create a GitHub Release when the automation is active, to avoid duplicate release errors.
 
 6. Dependencies
 - If external Go dependencies are used, vendor them (`vendor/`) when required by Traefik plugin expectations.
@@ -62,6 +70,9 @@ Optional fields:
 - [ ] Repo is public, not forked.
 - [ ] GitHub topic `traefik-plugin` is set.
 - [ ] Release tag created and pushed (for example `v0.1.0`).
+- [ ] New version follows `vX.Y.Z` and increments the previous published version.
+- [ ] Tag push triggered the automated release workflow successfully.
+- [ ] GitHub Release exists for the new tag and is marked `latest`.
 - [ ] No secrets/API keys committed in repository files.
 
 ## Standard Release Procedure
@@ -73,9 +84,12 @@ git commit -m "Initial Traefik plugin"
 git branch -M main
 git remote add origin git@github.com:<org-or-user>/<repo>.git
 git push -u origin main
-git tag v0.1.0
-git push origin v0.1.0
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
 ```
+
+> Note: the GitHub Release is created automatically by workflow after pushing the tag.
+> Manual `gh release create ...` should only be used as fallback if automation is unavailable.
 
 Then on GitHub:
 - Set repository visibility to public.

@@ -1,0 +1,48 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.1"
+
+      - name: Validate Traefik metadata consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          module_path="$(awk '/^module / { print $2 }' go.mod | tr -d '\r')"
+          import_path="$(awk -F': *' '/^import:/ { print $2 }' .traefik.yml | tr -d '\r')"
+
+          if [[ -z "${module_path}" || -z "${import_path}" ]]; then
+            echo "go.mod module path or .traefik.yml import is empty"
+            exit 1
+          fi
+
+          if [[ "${module_path}" != "${import_path}" ]]; then
+            echo "Mismatch detected:"
+            echo "go.mod module=${module_path}"
+            echo ".traefik.yml import=${import_path}"
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Run deterministic unit tests
+        run: |
+          set -euo pipefail
+          go test ./lrucache
+          go test . -run 'Test(EmptyApi|MissingIpInApi|EmptyAllowedCountryList|NilConfig|InvalidAllowedIPAddress|InvalidDeniedRequestStatusCode|InvalidCountryCode|NegativeAPITimeout|NegativeCacheSize|RemoteAddrFallbackWhenNoForwardedHeaders|NoIPFailClosed|NoIPFailOpen|TrustForwardedHeadersEnabled|CountryCodesAreNormalized)$' -count=1
