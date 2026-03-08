@@ -19,6 +19,5 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           makeLatest: true
-          generateReleaseNotes: false
-          bodyFile: CHANGELOG.md
+          generateReleaseNotes: true
           skipIfReleaseExists: true
