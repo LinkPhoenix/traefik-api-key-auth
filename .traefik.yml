@@ -11,8 +11,8 @@ testData:
   bearerHeader: true
   bearerHeaderName: Authorization
   removeHeadersOnSuccess: true
-  queryParam: true
+  queryParam: false
   queryParamName: token
-  pathSegment: true
+  pathSegment: false
   keys:
     - 83AB3503-50AA-4B57-9386-B9F0BADF2013
