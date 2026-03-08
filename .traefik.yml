@@ -4,6 +4,7 @@ type: middleware
 import: github.com/linkphoenix/traefik-api-key-auth
 
 summary: "Authorise API requests with an API Key"
+iconPath: .assets/logo.png
 
 testData:
   authenticationHeader: true
