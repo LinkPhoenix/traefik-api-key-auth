@@ -44,5 +44,4 @@ jobs:
       - name: Run deterministic unit tests
         run: |
           set -euo pipefail
-          go test ./lrucache
-          go test . -run 'Test(EmptyApi|MissingIpInApi|EmptyAllowedCountryList|NilConfig|InvalidAllowedIPAddress|InvalidDeniedRequestStatusCode|InvalidCountryCode|NegativeAPITimeout|NegativeCacheSize|RemoteAddrFallbackWhenNoForwardedHeaders|NoIPFailClosed|NoIPFailOpen|TrustForwardedHeadersEnabled|CountryCodesAreNormalized)$' -count=1
+          go test ./... -count=1
